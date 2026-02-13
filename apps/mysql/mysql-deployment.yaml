@@ -1,0 +1,106 @@
+# 1. ConfigMap：存储MySQL初始化SQL脚本，挂载到容器指定路径实现自动执行
+# 优势：修改SQL无需重新构建镜像，符合云原生「配置与镜像分离」原则
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-init-scripts  # ConfigMap名称，后续Deployment挂载时引用
+  namespace: ai-services    # 与Ollama同命名空间，统一管理AI相关服务
+data:
+  # 键为init.sql，值为完整的SQL初始化脚本（与第一步的hr_sample_schema.sql内容一致）
+  init.sql: |
+    CREATE DATABASE IF NOT EXISTS hr_db;
+    USE hr_db;
+    CREATE TABLE IF NOT EXISTS departments (
+        dept_id INT PRIMARY KEY,
+        dept_name VARCHAR(50) NOT NULL,
+        location VARCHAR(50)
+    );
+    CREATE TABLE IF NOT EXISTS employees (
+        emp_id INT PRIMARY KEY,
+        name VARCHAR(50) NOT NULL,
+        role VARCHAR(50),
+        salary DECIMAL(10, 2),
+        dept_id INT,
+        FOREIGN KEY (dept_id) REFERENCES departments(dept_id)
+    );
+    INSERT INTO departments VALUES (1, 'Engineering', 'Building A'), (2, 'Sales', 'Building B'), (3, 'HR', 'Building A');
+    INSERT INTO employees VALUES 
+    (101, 'Alice', 'Engineer', 90000, 1),
+    (102, 'Bob', 'Manager', 120000, 1),
+    (103, 'Charlie', 'Salesperson', 70000, 2),
+    (104, 'David', 'Recruiter', 60000, 3),
+    (105, 'Eve', 'Engineer', 95000, 1);
+---
+# 2. PVC：申请持久化存储卷，绑定OpenEBS HostPath存储类
+# 核心：避免Pod重启/重建后MySQL数据丢失，数据库必备配置
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pvc           # PVC名称，后续Deployment挂载时引用
+  namespace: ai-services
+spec:
+  accessModes:
+    - ReadWriteOnce         # 读写模式：单节点读写（满足MySQL单实例需求）
+  storageClassName: openebs-hostpath  # 绑定模块一配置的OpenEBS存储类
+  resources:
+    requests:
+      storage: 5Gi          # 申请5GB存储（实验环境足够）
+---
+# 3. Deployment：定义MySQL容器实例的部署规则
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql               # Deployment名称
+  namespace: ai-services
+spec:
+  selector:
+    matchLabels:
+      app: mysql            # 标签选择器，与Pod模板标签一致
+  strategy:
+    type: Recreate          # 重建策略：MySQL不支持多实例同时写，更新时先删旧Pod再建新Pod
+  template:
+    metadata:
+      labels:
+        app: mysql          # Pod标签，供Service和Selector引用
+    spec:
+      containers:
+      - name: mysql         # 容器名称
+        image: mysql:8.0    # 使用官方MySQL 8.0镜像，稳定无兼容问题
+        env:
+        # 配置MySQL root密码（实验环境直接写死，生产环境需用Secret加密）
+        - name: MYSQL_ROOT_PASSWORD
+          value: "native"
+        # 配置默认创建的数据库名（与SQL脚本中的hr_db一致）
+        - name: MYSQL_DATABASE
+          value: "hr_db"
+        ports:
+        - containerPort: 3306  # MySQL默认端口
+        volumeMounts:
+        # 挂载PVC到MySQL数据默认存储路径，实现数据持久化
+        - name: mysql-storage
+          mountPath: /var/lib/mysql
+        # 挂载ConfigMap到MySQL自动执行脚本的目录，实现初始化
+        - name: init-scripts
+          mountPath: /docker-entrypoint-initdb.d
+      # 定义卷：关联PVC和ConfigMap
+      volumes:
+      - name: mysql-storage
+        persistentVolumeClaim:
+          claimName: mysql-pvc  # 关联上述PVC
+      - name: init-scripts
+        configMap:
+          name: mysql-init-scripts  # 关联上述ConfigMap
+---
+# 4. Service：暴露MySQL服务为集群内访问的ClusterIP
+# 目的：让后续的MCP Server能通过「服务名:端口」访问MySQL，无需关注Pod的IP变化
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-service       # 集群内访问的服务名（核心，后续MCP Server配置用）
+  namespace: ai-services
+spec:
+  ports:
+  - port: 3306              # 服务端口，与容器端口一致
+  selector:
+    app: mysql              # 关联MySQL Pod的标签
+  # 未指定type，默认ClusterIP，仅集群内可访问（安全，无需外部暴露）
